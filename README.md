@@ -138,6 +138,59 @@ This is **not** a trained classifier. Re-calibrate the thresholds in
 trusting the number — the direction of the signal can flip between generators
 and codecs.
 
+---
+
+## Gallery — Example outputs
+
+### Spatial spectrum
+
+The spectrum video shows the 2D FFT of each frame. Real footage typically exhibits
+rich structure and sharp frequency features; AI-generated video often appears
+smoother and more uniform, with less high-frequency detail.
+
+**Real video:**
+![Real spectrum frame](images/real_spectra.png)
+
+**AI-generated video (Grok):**
+![AI-generated spectrum frame](images/ai_gen_spectra.png)
+
+Notice how the real video (top) shows more varied patterns and texture, while the
+AI-generated clip (bottom) has a smoother, more uniform spectrum with weaker
+high-frequency components.
+
+### RAPSD curves
+
+The Radially-Averaged Power Spectrum plots the raw frame spectrum (blue) and the
+high-pass residual (orange) in log-log space. Natural images follow a power law
+($1/f^{\alpha}$); deviations in the high-frequency tail are fingerprints of
+upsampling and noise generation.
+
+**Real video RAPSD:**
+![Real RAPSD](images/real_rapsd.png)
+
+**AI-generated video RAPSD:**
+![AI-generated RAPSD](images/ai_gen_rapsd.png)
+
+Key differences:
+- The residual curve (orange) shows **less negative mean** in the AI video—the high-pass
+  component is *less suppressed*, indicating over-smoothing of fine details.
+- The raw curve (blue) exhibits **lower high-frequency energy** in the AI video.
+
+### Temporal flicker map
+
+The temporal analysis captures per-pixel energy at high temporal frequencies.
+Real cameras exhibit more flicker and temporal variation; AI video often has
+over-smooth motion with reduced temporal noise.
+
+**Real video temporal spectrum + flicker map:**
+![Real temporal](images/real_temporal.png)
+
+**AI-generated video temporal spectrum + flicker map:**
+![AI-generated temporal](images/ai_gen_temporal.png)
+
+The flicker map (bottom of each panel) shows per-pixel temporal energy. Brighter
+pixels indicate more flicker. Real footage (left) is noticeably busier; the AI
+clip (right) is smoother, suggesting reduced temporal variations.
 
 ---
 
