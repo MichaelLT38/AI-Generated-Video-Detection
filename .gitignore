@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific
+examples/                          # Example videos (not included in repo)
+DISCUSSION_LOG.md                  # Session notes (not for distribution)
+.feature_cache.json                # Calibration cache
+calibration.json                   # Generated model (user-specific)
+
+# Generated outputs (video analysis results)
+*_spectra.mp4                       # Generated spectrum videos
+*_rapsd.png                         # Generated RAPSD plots
+*_rapsd.csv                         # Generated RAPSD data
+*_temporal.png                      # Generated temporal analysis
+*_report.txt                        # Generated analysis reports
+
+# Test videos
+*.mp4                               # Input videos (not versioned)
+
+# Pytest
+.pytest_cache/
