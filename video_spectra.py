@@ -11,10 +11,10 @@ These are fused into a single heuristic "synthetic likelihood" indicator.
 
 Outputs (all written next to the input video):
     <name>_spectra.mp4   - 512x512 colour spectrum video (one frame per source frame)
-    <name>_rapsd.png     - spatial RAPSD (raw + high-pass residual), averaged over frames
+    <name>_result.png    - one consolidated image: spatial RAPSD, temporal power
+                           spectrum, flicker map, residual-fingerprint FFT, the
+                           feature readings, and the score/verdict in bold
     <name>_rapsd.csv     - RAPSD curves + summary detection features
-    <name>_temporal.png  - temporal power spectrum + per-pixel flicker map
-    <name>_report.txt    - all features and the combined heuristic score
 
 Usage:
     python video_spectra.py <path-to-video.mp4> [output_spectra.mp4]
@@ -40,11 +40,49 @@ import numpy as np
 # Spectrum video is rendered at a fixed square resolution (1:1 aspect ratio).
 SPECTRUM_SIZE = 512
 
+# The fingerprint FFT amplitude is analysed at a higher fixed resolution than the
+# spectrum video. More pixels between lattice nodes keeps the periodic generator
+# peaks compact and separable instead of being merged by the area-downsample, so
+# faint lattices stand a better chance of being detected and circled. All
+# fingerprint detection thresholds below are fractions of this size, so they
+# scale with it automatically.
+FINGERPRINT_SIZE = 1024
+
 # Temporal analysis: frames are downscaled and a bounded number are collected
 # to keep memory in check on long clips.
 TEMPORAL_SIZE = 128
 TEMPORAL_TARGET_FRAMES = 600
 GAUSSIAN_SIGMA = 1.5  # high-pass cutoff for residual analysis
+
+# Fingerprint peak detection (circled hot spots in the residual FFT amplitude).
+# The genuine upsampling fingerprint is a *single regular 2D lattice* of compact
+# blobs: every peak sits at DC + m*v1 + n*v2 for integer m, n. The detector
+# band-pass filters to keep compact blobs (rejecting the broad bright lobes and
+# pixel noise), gathers candidates, then fits ONE global lattice and circles only
+# the candidates that fall on it and span several grid cells. Isolated blobs,
+# clustered lobe texture, and curved arcs do not form a wide 2D lattice, so they
+# are rejected.
+FINGERPRINT_DC_RADIUS_FRAC = 0.045      # exclude only the DC term / its disk
+FINGERPRINT_OUTER_RADIUS_FRAC = 0.49    # ignore the near-edge / Nyquist noise
+FINGERPRINT_CAND_SIGMA = 3.0            # permissive candidate (MAD) threshold
+FINGERPRINT_MAX_PEAKS = 80              # cap on the number of circled hot spots
+# Band-pass (difference-of-Gaussians) scales: small = denoise, large = remove
+# broad lobes/streaks. Both scale with the image size so blob/noise proportions
+# stay constant regardless of the analysis resolution.
+FINGERPRINT_BP_SMALL_DIV = 425.0        # small sigma = image_size / divisor
+FINGERPRINT_BP_LARGE_DIV = 40.0         # large sigma = image_size / divisor
+FINGERPRINT_MIN_SEPARATION_FRAC = 0.022  # min spacing so one blob -> one candidate
+FINGERPRINT_CAND_CAP = 220              # cap candidates (keeps O(n^2) fit cheap)
+# Global lattice fit parameters.
+FINGERPRINT_GRID_TOL_FRAC = 0.018       # spacing-vote tolerance (basis histogram)
+FINGERPRINT_FIT_TOL_FRAC = 0.010        # how close to a node counts as an inlier
+FINGERPRINT_GRID_MIN_PERIOD_FRAC = 0.05  # smallest believable lattice spacing
+FINGERPRINT_GRID_MAX_PERIOD_FRAC = 0.32  # largest believable basis spacing
+FINGERPRINT_BASIS_MIN_VOTES = 6         # pairs that must share a basis spacing
+FINGERPRINT_GRID_MIN_INLIERS = 8        # min on-lattice peaks before drawing
+FINGERPRINT_GRID_MIN_SPAN = 2           # lattice must span >= this many cells per axis
+FINGERPRINT_GRID_MIN_FRACTION = 0.45    # >= this share of candidates must be on-grid
+FINGERPRINT_GRID_SIGNIF_FACTOR = 3.0    # inliers must exceed chance count by this x
 
 # Optional calibrated logistic-regression model produced by ``calibrate.py``.
 # If this file exists next to the script it overrides the hand-tuned ramps.
@@ -103,6 +141,295 @@ def high_pass_residual(gray: np.ndarray) -> np.ndarray:
     g = gray.astype(np.float32)
     blur = cv2.GaussianBlur(g, (0, 0), GAUSSIAN_SIGMA)
     return g - blur
+
+
+def compute_fingerprint_spectrum(fingerprint: np.ndarray) -> dict:
+    """2D FFT amplitude (log) of the averaged high-pass residual fingerprint.
+
+    Averaging the *signed* residual over many frames cancels incoherent scene
+    content while the generator's spatially-coherent periodic fingerprint
+    survives. Its FFT amplitude exposes the regular peak grid left by
+    transposed-convolution / upsampling layers - a classic AI-video artifact.
+
+    Returns a dict with ``image`` (8-bit centred amplitude at the fixed square
+    resolution, ready for colormapping) and ``peaks`` (a list of ``(x, y)``
+    hot-spot coordinates in that image, the candidate AI fingerprint peaks).
+    """
+    f = fingerprint.astype(np.float32)
+    f = f - f.mean()
+
+    # Hann window suppresses the FFT edge-wrap cross artifact so genuine
+    # generator peaks are not masked by spectral leakage.
+    wy = np.hanning(f.shape[0])
+    wx = np.hanning(f.shape[1])
+    f = f * np.outer(wy, wx)
+
+    fft = np.fft.fftshift(np.fft.fft2(f))
+    amplitude = np.log1p(np.abs(fft))
+
+    # Resample the float amplitude to the fixed square (1:1) analysis resolution
+    # so the display image and detected peak coordinates share one space.
+    amplitude = cv2.resize(
+        amplitude, (FINGERPRINT_SIZE, FINGERPRINT_SIZE), interpolation=cv2.INTER_AREA
+    )
+
+    img = cv2.normalize(amplitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    peaks = detect_spectral_peaks(amplitude)
+    return {"image": img, "peaks": peaks}
+
+
+def detect_spectral_peaks(amplitude: np.ndarray) -> list[tuple[int, int]]:
+    """Locate the regular *lattice* of hot spots in a centred FFT log-amplitude.
+
+    The genuine upsampling fingerprint is a single 2D lattice of compact blobs.
+    We therefore:
+
+      1. band-pass filter (difference of Gaussians) so only compact blobs
+         survive - this removes the broad bright low-frequency lobes and the
+         smooth radial streaks that previously produced false candidates;
+      2. gather candidate local maxima in the valid annulus;
+      3. fit ONE global lattice and keep only candidates that fall on it and
+         span several grid cells (see ``_select_lattice_peaks``).
+
+    Isolated blobs, clustered lobe texture and curved arcs do not form a wide
+    2D lattice, so they are rejected. An empty list means no lattice was found
+    (real footage is usually featureless here).
+    """
+    amp = amplitude.astype(np.float32)
+    h, w = amp.shape
+    cy, cx = h / 2.0, w / 2.0
+    size = min(h, w)
+
+    # Band-pass: keep compact grid blobs, suppress BOTH pixel noise (small scale)
+    # and the broad bright lobes / radial streaks (large scale). A plain wide
+    # background left the lobes behind; the difference of Gaussians removes them.
+    small = cv2.GaussianBlur(amp, (0, 0), sigmaX=max(1.0, size / FINGERPRINT_BP_SMALL_DIV))
+    large = cv2.GaussianBlur(amp, (0, 0), sigmaX=max(2.0, size / FINGERPRINT_BP_LARGE_DIV))
+    prominence = small - large
+
+    # Mask the central DC disk, the thin leakage cross, and the Nyquist edge.
+    y, x = np.indices((h, w))
+    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    inner = FINGERPRINT_DC_RADIUS_FRAC * size
+    outer = FINGERPRINT_OUTER_RADIUS_FRAC * size
+    exclude = (
+        (r < inner)
+        | (r > outer)
+        | (np.abs(x - cx) < 2)
+        | (np.abs(y - cy) < 2)
+    )
+
+    valid = prominence[~exclude]
+    if valid.size == 0:
+        return []
+
+    # Permissive robust threshold to gather grid candidates (even dim ones); the
+    # global lattice fit below removes the false positives this lets in.
+    med = float(np.median(valid))
+    mad = float(np.median(np.abs(valid - med))) + 1e-6
+    threshold = med + FINGERPRINT_CAND_SIGMA * 1.4826 * mad
+
+    floor = float(prominence.min()) - 1.0
+    work = prominence.copy()
+    work[exclude] = floor
+    # Local-max window scales with resolution so one blob yields one maximum
+    # regardless of the analysis size.
+    win = max(3, int(round(size / 100.0)) | 1)
+    dilated = cv2.dilate(work, np.ones((win, win), np.uint8))
+    is_peak = (work == dilated) & (work > threshold)
+
+    ys, xs = np.nonzero(is_peak)
+    if ys.size == 0:
+        return []
+
+    # Non-max suppression so a single textured blob yields one candidate.
+    order = np.argsort(work[ys, xs])[::-1]
+    min_sep = FINGERPRINT_MIN_SEPARATION_FRAC * size
+    min_sep_sq = min_sep * min_sep
+    candidates: list[tuple[int, int]] = []
+    for i in order:
+        px, py = int(xs[i]), int(ys[i])
+        if all((px - ax) ** 2 + (py - ay) ** 2 >= min_sep_sq for ax, ay in candidates):
+            candidates.append((px, py))
+        if len(candidates) >= FINGERPRINT_CAND_CAP:
+            break
+
+    return _select_lattice_peaks(candidates, (cx, cy), size)
+
+
+def _candidate_basis_vectors(
+    pts: np.ndarray, tol: float, min_period: float, max_period: float, top_k: int = 16
+) -> list[np.ndarray]:
+    """Return the most frequently-occurring pairwise spacing vectors.
+
+    The basis vectors of a lattice (and their low multiples) recur far more
+    often than random spacings. We histogram canonical pairwise differences,
+    merge neighbouring bins, drop near-duplicates, and return the top vectors by
+    vote so the caller can search for the basis that best explains the peaks.
+    """
+    n = len(pts)
+    buckets: dict[tuple[int, int], int] = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = pts[j, 0] - pts[i, 0]
+            dy = pts[j, 1] - pts[i, 1]
+            if dx < 0 or (dx == 0 and dy < 0):
+                dx, dy = -dx, -dy
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < min_period or dist > max_period:
+                continue
+            key = (int(round(dx / tol)), int(round(dy / tol)))
+            buckets[key] = buckets.get(key, 0) + 1
+    if not buckets:
+        return []
+
+    def merged_votes(key: tuple[int, int]) -> int:
+        kx, ky = key
+        total = 0
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                total += buckets.get((kx + ox, ky + oy), 0)
+        return total
+
+    scored = sorted(
+        ((merged_votes(k), k) for k in buckets), key=lambda t: t[0], reverse=True
+    )
+
+    vectors: list[np.ndarray] = []
+    for votes, key in scored:
+        if votes < FINGERPRINT_BASIS_MIN_VOTES:
+            break
+        v = np.array([key[0] * tol, key[1] * tol], dtype=np.float64)
+        # Drop near-duplicates already collected (within tolerance).
+        if any(float(np.hypot(*(v - u))) <= tol for u in vectors):
+            continue
+        vectors.append(v)
+        if len(vectors) >= top_k:
+            break
+    return vectors
+
+
+def _select_lattice_peaks(
+    candidates: list[tuple[int, int]],
+    center: tuple[float, float],
+    size: float,
+) -> list[tuple[int, int]]:
+    """Keep only candidates that fall on a single global 2D lattice.
+
+    Candidate basis vectors are taken from the dominant pairwise spacings, then
+    every non-parallel pair ``(v1, v2)`` is tried as a basis; the basis that
+    puts the most candidates on integer lattice nodes wins. Because a dense field
+    of candidates lands near *some* node by chance, acceptance of the winning
+    basis still requires the inlier count to (a) far exceed the chance count for
+    that basis, (b) form a large fraction of all candidates, and (c) span several
+    cells along both axes. Clustered noise, curved arcs and uniform texture all
+    fail at least one test and are rejected.
+    """
+    n = len(candidates)
+    if n < FINGERPRINT_GRID_MIN_INLIERS:
+        return []
+
+    pts = np.asarray(candidates, dtype=np.float64)
+    tol = max(1.0, FINGERPRINT_GRID_TOL_FRAC * size)
+    min_period = FINGERPRINT_GRID_MIN_PERIOD_FRAC * size
+    max_period = FINGERPRINT_GRID_MAX_PERIOD_FRAC * size
+    fit_tol = max(2.0, FINGERPRINT_FIT_TOL_FRAC * size)
+    c = np.asarray(center, dtype=np.float64)
+    rel_all = pts - c
+
+    vectors = _candidate_basis_vectors(pts, tol, min_period, max_period)
+    if len(vectors) < 2:
+        return []
+
+    def fit_basis(basis_matrix: np.ndarray):
+        cell_area = abs(float(np.linalg.det(basis_matrix)))
+        if cell_area < 1e-6:
+            return None
+        try:
+            inv_basis = np.linalg.inv(basis_matrix)
+        except np.linalg.LinAlgError:
+            return None
+        coeffs = rel_all @ inv_basis.T          # fractional (m, n) per candidate
+        ints = np.round(coeffs)
+        recon = ints @ basis_matrix.T           # nearest node offset from centre
+        resid = np.hypot(recon[:, 0] - rel_all[:, 0], recon[:, 1] - rel_all[:, 1])
+        on = (resid <= fit_tol) & ~((ints[:, 0] == 0) & (ints[:, 1] == 0))
+        idx = np.nonzero(on)[0]
+        return basis_matrix, cell_area, idx, ints[idx]
+
+    def refine(v1: np.ndarray, v2: np.ndarray):
+        # The histogram only locates the basis to bucket resolution, which is
+        # too coarse to use directly (period error accumulates over cells).
+        # Iteratively re-fit the basis from its own inliers by least squares.
+        basis_matrix = np.column_stack([v1, v2]).astype(np.float64)
+        res = fit_basis(basis_matrix)
+        for _ in range(5):
+            if res is None:
+                return None
+            _, _, idx, node_ints = res
+            if len(idx) < 4 or np.linalg.matrix_rank(node_ints) < 2:
+                return res
+            # Solve rel_inliers = node_ints @ M.T  for M (2x2).
+            sol, *_ = np.linalg.lstsq(node_ints, rel_all[idx], rcond=None)
+            new_matrix = sol.T
+            new_res = fit_basis(new_matrix)
+            if new_res is None:
+                return res
+            if np.allclose(new_matrix, basis_matrix, atol=1e-2):
+                return new_res
+            basis_matrix = new_matrix
+            res = new_res
+        return res
+
+    # Search non-parallel basis pairs; keep the one with the most inliers.
+    best = None
+    for a in range(len(vectors)):
+        for b in range(len(vectors)):
+            if a == b:
+                continue
+            v1, v2 = vectors[a], vectors[b]
+            cross = abs(v1[0] * v2[1] - v1[1] * v2[0])
+            if cross <= 0.25 * float(np.hypot(*v1)) * float(np.hypot(*v2)):
+                continue  # near-parallel -> not a 2D basis
+            res = refine(v1, v2)
+            if res is None:
+                continue
+            _, _, idx, _ = res
+            if best is None or len(idx) > best[0]:
+                best = (len(idx), res)
+
+    if best is None:
+        return []
+
+    res = best[1]
+    if res is None:
+        return []
+    basis_matrix, cell_area, idx, node_ints = res
+    n_inliers = int(len(idx))
+    if n_inliers < FINGERPRINT_GRID_MIN_INLIERS:
+        return []
+
+    # (a) Significance vs a random field of n points for this basis.
+    expected_by_chance = n * np.pi * fit_tol * fit_tol / cell_area
+    if n_inliers < FINGERPRINT_GRID_SIGNIF_FACTOR * expected_by_chance:
+        return []
+
+    # (b) A real grid is made *of* these peaks, so most candidates are on it.
+    if n_inliers / n < FINGERPRINT_GRID_MIN_FRACTION:
+        return []
+
+    # (c) Require the inliers to span several cells along BOTH axes.
+    ms = node_ints[:, 0]
+    ks = node_ints[:, 1]
+    if (ms.max() - ms.min()) < FINGERPRINT_GRID_MIN_SPAN or (
+        ks.max() - ks.min()
+    ) < FINGERPRINT_GRID_MIN_SPAN:
+        return []
+    if len(np.unique(ms)) < FINGERPRINT_GRID_MIN_SPAN or len(np.unique(ks)) < FINGERPRINT_GRID_MIN_SPAN:
+        return []
+
+    return [candidates[i] for i in idx.tolist()][:FINGERPRINT_MAX_PEAKS]
+
 
 
 def compute_features(radii: np.ndarray, rapsd: np.ndarray) -> dict[str, float]:
@@ -269,25 +596,18 @@ def analyse_and_convert(input_path: Path, spectra_path: Path) -> None:
         return
 
     features = result["features"]
-    write_rapsd_outputs(
+    score = compute_score(features)
+
+    # One consolidated image (plots + readings + score/verdict) plus the raw
+    # RAPSD curves as CSV for numeric comparison.
+    write_result_image(input_path, result, features, score)
+    write_rapsd_csv(
         input_path,
         result["radii"],
         result["rapsd"],
         result["residual_rapsd"],
         features,
     )
-
-    temporal = result["temporal"]
-    if temporal is not None:
-        write_temporal_outputs(
-            input_path,
-            temporal["freqs"],
-            temporal["spectrum"],
-            temporal["flicker_img"],
-        )
-
-    score = compute_score(features)
-    write_report(input_path, features, score, result["frame_count"])
 
 
 def process_video(
@@ -330,6 +650,8 @@ def process_video(
 
     rapsd_accum: np.ndarray | None = None
     residual_accum: np.ndarray | None = None
+    fingerprint_accum: np.ndarray | None = None
+    fingerprint_count = 0
     temporal_frames: list[np.ndarray] = []
     frame_index = 0
     try:
@@ -355,6 +677,18 @@ def process_video(
                 residual_accum = np.zeros_like(res_profile)
             m = min(len(residual_accum), len(res_profile))
             residual_accum[:m] += res_profile[:m]
+
+            # Accumulate the signed residual itself to estimate the spatially
+            # coherent artificial fingerprint. Normalising each frame's residual
+            # by its own std equalises contributions so a few high-contrast
+            # frames cannot dominate the coherent average.
+            if fingerprint_accum is None:
+                fingerprint_accum = np.zeros_like(residual)
+            if residual.shape == fingerprint_accum.shape:
+                res_std = float(residual.std())
+                if res_std > 1e-6:
+                    fingerprint_accum += residual / res_std
+                    fingerprint_count += 1
 
             # Collect a downscaled frame for the temporal FFT.
             if frame_index % temporal_stride == 0:
@@ -412,10 +746,20 @@ def process_video(
             temporal_frames, fps
         )
         features.update(t_features)
+
+        # FFT amplitude of the averaged residual fingerprint (shown next to the
+        # flicker map) plus the detected hot-spot peaks. Estimated from every
+        # processed frame's std-normalised residual.
+        fingerprint = None
+        if fingerprint_accum is not None and fingerprint_count > 0:
+            mean_residual = fingerprint_accum / fingerprint_count
+            fingerprint = compute_fingerprint_spectrum(mean_residual)
+
         temporal = {
             "freqs": t_freqs,
             "spectrum": t_spectrum,
             "flicker_img": flicker_img,
+            "fingerprint": fingerprint,
         }
     else:
         print("Too few frames for temporal analysis; skipping.")
@@ -433,53 +777,15 @@ def process_video(
 
 
 
-def write_rapsd_outputs(
+def write_rapsd_csv(
     input_path: Path,
     radii: np.ndarray,
     rapsd: np.ndarray,
     residual_rapsd: np.ndarray,
     features: dict[str, float],
 ) -> None:
-    plot_path = input_path.with_name(f"{input_path.stem}_rapsd.png")
+    """Write the summary features and full RAPSD curves to ``<name>_rapsd.csv``."""
     csv_path = input_path.with_name(f"{input_path.stem}_rapsd.csv")
-
-    # --- Plot (log-log RAPSD: raw + high-pass residual) ---
-    valid = radii > 0
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.loglog(radii[valid], rapsd[valid] + 1e-12, color="#d9480f", label="raw frame")
-    ax.loglog(
-        radii[valid],
-        residual_rapsd[valid] + 1e-12,
-        color="#1c7ed6",
-        label="high-pass residual",
-    )
-    ax.set_title(f"Radially-Averaged Power Spectrum\n{input_path.name}")
-    ax.set_xlabel("Radial spatial frequency (pixels from centre)")
-    ax.set_ylabel("Mean power (log)")
-    ax.grid(True, which="both", linewidth=0.3, alpha=0.5)
-    ax.legend(loc="upper right", fontsize=9)
-
-    summary = (
-        f"log-log slope: {features['rapsd_loglog_slope']:.3f}\n"
-        f"HF energy ratio: {features['high_freq_energy_ratio']:.4f}\n"
-        f"HF residual mean: {features['high_freq_residual_mean']:.4f}\n"
-        f"residual HF ratio: {features['residual_high_freq_energy_ratio']:.4f}"
-    )
-    ax.text(
-        0.02,
-        0.02,
-        summary,
-        transform=ax.transAxes,
-        fontsize=9,
-        va="bottom",
-        ha="left",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-    )
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=120)
-    plt.close(fig)
-
-    # --- CSV (features header + full RAPSD curves) ---
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["# summary_features"])
@@ -492,89 +798,219 @@ def write_rapsd_outputs(
         ):
             w.writerow([radius, raw_p, res_p])
 
-    print(f"RAPSD plot: {plot_path}")
     print(f"RAPSD data: {csv_path}")
 
 
-def write_temporal_outputs(
-    input_path: Path,
-    freqs: np.ndarray,
-    spectrum: np.ndarray,
-    flicker_img: np.ndarray,
-) -> None:
-    plot_path = input_path.with_name(f"{input_path.stem}_temporal.png")
-
-    flicker_colored = cv2.applyColorMap(flicker_img, cv2.COLORMAP_MAGMA)
-    flicker_rgb = cv2.cvtColor(flicker_colored, cv2.COLOR_BGR2RGB)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
-
-    # Skip the DC bin (index 0) which was already mean-removed.
-    ax1.semilogy(freqs[1:], spectrum[1:] + 1e-12, color="#5f3dc4")
-    ax1.set_title("Temporal Power Spectrum")
-    ax1.set_xlabel("Temporal frequency (Hz)")
-    ax1.set_ylabel("Mean power (log)")
-    ax1.grid(True, which="both", linewidth=0.3, alpha=0.5)
-
-    ax2.imshow(flicker_rgb)
-    ax2.set_title("Per-pixel Flicker Map (non-DC energy)")
-    ax2.axis("off")
-
-    fig.suptitle(input_path.name)
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=120)
-    plt.close(fig)
-
-    print(f"Temporal plot: {plot_path}")
-
-
-def write_report(
-    input_path: Path,
-    features: dict[str, float],
-    score: float,
-    frame_count: int,
-) -> None:
-    report_path = input_path.with_name(f"{input_path.stem}_report.txt")
-
+def _verdict_for(score: float) -> tuple[str, str]:
+    """Map a 0-1 score to a (verdict label, display colour)."""
     if score >= 0.55:
-        verdict = "LEANS SYNTHETIC"
-    elif score >= 0.35:
-        verdict = "UNCERTAIN"
-    else:
-        verdict = "LEANS REAL"
+        return "LEANS SYNTHETIC", "#c92a2a"
+    if score >= 0.35:
+        return "UNCERTAIN", "#e8590c"
+    return "LEANS REAL", "#2b8a3e"
 
+
+def _scorer_method() -> str:
+    """Describe which scorer (calibrated model vs ramps) is in use."""
     model = load_calibration()
     if model is not None:
-        method = (
+        return (
             f"calibrated logistic regression "
             f"(n={model.get('n_samples', '?')}, "
             f"LOO acc={model.get('loo_accuracy', float('nan')):.2f})"
         )
+    return "hand-tuned ramps (no calibration model found)"
+
+
+def write_result_image(
+    input_path: Path,
+    result: dict,
+    features: dict[str, float],
+    score: float,
+) -> None:
+    """Render the single consolidated ``<name>_result.png``.
+
+    Combines the RAPSD plot, temporal power spectrum, flicker map and
+    fingerprint FFT amplitude with the numeric readings, and the synthetic
+    likelihood score / verdict in bold at the bottom.
+    """
+    plot_path = input_path.with_name(f"{input_path.stem}_result.png")
+
+    radii = result["radii"]
+    rapsd = result["rapsd"]
+    residual_rapsd = result["residual_rapsd"]
+    temporal = result["temporal"]
+    frame_count = result["frame_count"]
+
+    verdict, verdict_color = _verdict_for(score)
+    method = _scorer_method()
+
+    has_temporal = temporal is not None
+    has_fingerprint = has_temporal and temporal.get("fingerprint") is not None
+    n_fingerprint_peaks = 0
+
+    # --- Figure layout ---
+    if has_temporal:
+        fig = plt.figure(figsize=(13, 14))
+        gs = fig.add_gridspec(
+            4, 2, height_ratios=[1.0, 1.55, 0.65, 0.18], hspace=0.45, wspace=0.25
+        )
+        ax_rapsd = fig.add_subplot(gs[0, 0])
+        ax_tspec = fig.add_subplot(gs[0, 1])
+        # Give the two image panels their own tighter sub-grid so they fill
+        # more of the row and sit closer together (without touching).
+        img_gs = gs[1, :].subgridspec(1, 2, wspace=0.06)
+        ax_flicker = fig.add_subplot(img_gs[0, 0])
+        ax_finger = fig.add_subplot(img_gs[0, 1])
+        ax_text = fig.add_subplot(gs[2, :])
     else:
-        method = "hand-tuned ramps (no calibration model found)"
+        fig = plt.figure(figsize=(9, 9))
+        gs = fig.add_gridspec(3, 1, height_ratios=[1.4, 0.8, 0.18], hspace=0.5)
+        ax_rapsd = fig.add_subplot(gs[0, 0])
+        ax_text = fig.add_subplot(gs[1, 0])
+        ax_tspec = ax_flicker = ax_finger = None
 
-    lines = [
-        f"Spectral AI-video analysis report",
-        f"=================================",
-        f"File         : {input_path.name}",
-        f"Frames used  : {frame_count}",
-        f"Scorer       : {method}",
-        f"",
-        f"Synthetic likelihood score: {score:.3f}  (0 = real-like, 1 = synthetic-like)",
-        f"Verdict                   : {verdict}",
-        f"",
-        f"This score is a transparent heuristic, NOT proof. Compression weakens",
-        f"the signal and newer generators suppress these artifacts. Always compare",
-        f"against a real-footage baseline from a similar camera/codec.",
-        f"",
-        f"Features:",
-    ]
-    for key, value in features.items():
-        lines.append(f"  {key:<32}: {value:.6f}")
+    # --- RAPSD (raw + high-pass residual) ---
+    valid = radii > 0
+    ax_rapsd.loglog(
+        radii[valid], rapsd[valid] + 1e-12, color="#d9480f", label="raw frame"
+    )
+    ax_rapsd.loglog(
+        radii[valid],
+        residual_rapsd[valid] + 1e-12,
+        color="#1c7ed6",
+        label="high-pass residual",
+    )
+    ax_rapsd.set_title("Radially-Averaged Power Spectrum")
+    ax_rapsd.set_xlabel("Radial spatial frequency (pixels from centre)")
+    ax_rapsd.set_ylabel("Mean power (log)")
+    ax_rapsd.grid(True, which="both", linewidth=0.3, alpha=0.5)
+    ax_rapsd.legend(loc="upper right", fontsize=8)
 
-    report_path.write_text("\n".join(lines) + "\n")
+    # --- Temporal panels ---
+    if has_temporal:
+        freqs = temporal["freqs"]
+        spectrum = temporal["spectrum"]
+        flicker_img = temporal["flicker_img"]
 
-    print(f"Report: {report_path}")
+        # Skip the DC bin (index 0) which was already mean-removed.
+        ax_tspec.semilogy(freqs[1:], spectrum[1:] + 1e-12, color="#5f3dc4")
+        ax_tspec.set_title("Temporal Power Spectrum")
+        ax_tspec.set_xlabel("Temporal frequency (Hz)")
+        ax_tspec.set_ylabel("Mean power (log)")
+        ax_tspec.grid(True, which="both", linewidth=0.3, alpha=0.5)
+
+        flicker_rgb = cv2.cvtColor(
+            cv2.applyColorMap(flicker_img, cv2.COLORMAP_MAGMA), cv2.COLOR_BGR2RGB
+        )
+        ax_flicker.imshow(flicker_rgb)
+        ax_flicker.set_title("Per-pixel Flicker Map (non-DC energy)")
+        ax_flicker.axis("off")
+
+        if has_fingerprint:
+            fingerprint = temporal["fingerprint"]
+            fingerprint_rgb = cv2.cvtColor(
+                cv2.applyColorMap(fingerprint["image"], cv2.COLORMAP_INFERNO),
+                cv2.COLOR_BGR2RGB,
+            )
+            ax_finger.imshow(fingerprint_rgb, aspect="equal")
+
+            # Circle the detected high-frequency hot spots (candidate AI
+            # upsampling fingerprint peaks).
+            peaks = fingerprint.get("peaks", [])
+            n_fingerprint_peaks = len(peaks)
+            circle_r = FINGERPRINT_SIZE * 0.028
+            for px, py in peaks:
+                ax_finger.add_patch(
+                    plt.Circle(
+                        (px, py),
+                        radius=circle_r,
+                        fill=False,
+                        edgecolor="#00e5ff",
+                        linewidth=1.4,
+                        alpha=0.9,
+                    )
+                )
+            if n_fingerprint_peaks:
+                cue = (
+                    f"{n_fingerprint_peaks} hot spot"
+                    f"{'s' if n_fingerprint_peaks != 1 else ''} circled "
+                    f"(possible AI fingerprint)"
+                )
+            else:
+                cue = "no strong peaks"
+            ax_finger.set_title(
+                f"Fingerprint FFT Amplitude (avg residual, log)\n{cue}"
+            )
+        else:
+            ax_finger.text(
+                0.5,
+                0.5,
+                "fingerprint\nunavailable",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#868e96",
+            )
+        ax_finger.axis("off")
+
+    # --- Readings block (formerly the .txt report) ---
+    ax_text.axis("off")
+    feature_lines = "\n".join(f"{k:<32}: {v:.6f}" for k, v in features.items())
+    readings = (
+        f"File        : {input_path.name}\n"
+        f"Frames used : {frame_count}\n"
+        f"Scorer      : {method}\n"
+        f"Fingerprint hot spots circled : {n_fingerprint_peaks}\n"
+        f"\n"
+        f"Features:\n"
+        f"{feature_lines}\n"
+        f"\n"
+        f"Note: transparent heuristic, NOT proof. Compression weakens the signal and\n"
+        f"newer generators suppress these artifacts. Compare against a real-footage\n"
+        f"baseline from a similar camera/codec."
+    )
+    ax_text.text(
+        0.0,
+        1.0,
+        readings,
+        transform=ax_text.transAxes,
+        fontsize=9,
+        family="monospace",
+        va="top",
+        ha="left",
+    )
+
+    # --- Score / verdict in bold at the bottom ---
+    fig.text(
+        0.5,
+        0.045,
+        f"Synthetic likelihood: {score:.3f}    \u00b7    {verdict}",
+        ha="center",
+        va="center",
+        fontsize=18,
+        fontweight="bold",
+        color=verdict_color,
+    )
+    fig.text(
+        0.5,
+        0.018,
+        "(0 = real-like, 1 = synthetic-like)",
+        ha="center",
+        va="center",
+        fontsize=9,
+        color="#495057",
+    )
+
+    fig.suptitle(
+        f"Spectral AI-video analysis \u2014 {input_path.name}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.savefig(plot_path, dpi=120)
+    plt.close(fig)
+
+    print(f"Result image: {plot_path}")
     print(f"Synthetic likelihood score: {score:.3f} ({verdict})")
     print("Features (compare against a real-footage baseline):")
     for key, value in features.items():

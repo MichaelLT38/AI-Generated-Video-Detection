@@ -1,4 +1,9 @@
-# Python
+# NOTE: git only treats '#' as a comment when it is the FIRST character on a
+# line. Inline comments after a pattern (e.g. "examples/  # notes") are NOT
+# supported and become part of the pattern, so every comment lives on its own
+# line below.
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
@@ -19,8 +24,15 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
-# IDE / Editor
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDE / Editor ---
 .vscode/
 .idea/
 *.swp
@@ -28,21 +40,31 @@ wheels/
 *~
 .DS_Store
 
-# Project-specific
-examples/                          # Example videos (not included in repo)
-DISCUSSION_LOG.md                  # Session notes (not for distribution)
-.feature_cache.json                # Calibration cache
-calibration.json                   # Generated model (user-specific)
+# --- Project-specific (notes, caches, generated models) ---
+# Example videos and all generated test/inspection renders (kept locally for
+# personal use, not versioned).
+examples/
+# Session notes (not for distribution)
+DISCUSSION_LOG.md
+# Calibration feature cache
+.feature_cache.json
+# Generated, user-specific model
+calibration.json
+# Local helper / test scripts (not part of the shipped tool)
+render_fp_tests.py
+dump_real_fingerprints.py
 
-# Generated outputs (video analysis results)
-*_spectra.mp4                       # Generated spectrum videos
-*_rapsd.png                         # Generated RAPSD plots
-*_rapsd.csv                         # Generated RAPSD data
-*_temporal.png                      # Generated temporal analysis
-*_report.txt                        # Generated analysis reports
+# --- Generated analysis outputs ---
+# Spectrum videos
+*_spectra.mp4
+# Consolidated result image
+*_result.png
+# RAPSD numeric data
+*_rapsd.csv
+# Legacy split outputs (kept ignored for older runs)
+*_rapsd.png
+*_temporal.png
+*_report.txt
 
-# Test videos
-*.mp4                               # Input videos (not versioned)
-
-# Pytest
-.pytest_cache/
+# --- Input videos (not versioned) ---
+*.mp4

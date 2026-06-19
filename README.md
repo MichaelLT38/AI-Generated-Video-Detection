@@ -13,15 +13,13 @@ fingerprints commonly left by AI-generated (GAN / diffusion) video.
 
 ## Features
 
-For any input `video.mp4`, the tool writes five files next to the original:
+For any input `video.mp4`, the tool writes three files next to the original:
 
 | Output | Description |
 | --- | --- |
 | `video_spectra.mp4` | 512×512 (1:1) colour spectrum video — one FFT frame per source frame, log-scaled, inferno colormap. |
-| `video_rapsd.png` | Radially-Averaged Power Spectrum (RAPSD), averaged over all frames. Plots the raw-frame curve and the high-pass residual curve. |
+| `video_result.png` | One consolidated analysis image: the RAPSD curves, temporal power spectrum, per-pixel flicker map, residual-fingerprint FFT amplitude (with high-frequency AI hot spots circled), all feature readings, and the synthetic-likelihood score + verdict (in bold at the bottom). |
 | `video_rapsd.csv` | Summary features plus the full RAPSD curves (raw + residual) for numeric comparison. |
-| `video_temporal.png` | Temporal power spectrum (per-pixel FFT along time) plus a per-pixel flicker map. |
-| `video_report.txt` | All extracted features plus a single combined "synthetic likelihood" score. |
 
 A separate calibration helper, `calibrate.py`, can fit a model from your own
 labelled clips — see [Calibration](#calibration-optional-recommended-with-enough-clips).
@@ -114,7 +112,21 @@ A bounded stack of downscaled frames (128×128, capped near 600 frames) is FFT'd
 along the **time axis** (`np.fft.rfft`). Real cameras concentrate temporal
 energy near DC; AI video often shows extra energy at higher temporal
 frequencies (flicker / temporal inconsistency). Outputs are the average
-temporal spectrum and a per-pixel flicker map.
+temporal spectrum, a per-pixel flicker map, and the FFT amplitude of the
+averaged high-pass residual (the estimated generator fingerprint).
+
+Each frame's residual is normalised by its own standard deviation before
+averaging, so a few high-contrast frames cannot dominate the coherent
+fingerprint estimate. In the fingerprint FFT panel, the tool then looks for the
+**regular lattice of peaks** left by upsampling layers: candidate hot spots are
+detected (after subtracting a smooth background and masking the DC term and
+Nyquist edge), and only those that belong to a *repeating grid* are circled. A
+peak is kept when it forms an equally-spaced collinear chain (P−v, P, P+v, P+2v)
+whose spacing `v` recurs across multiple chains — the signature of a lattice
+that repeats identically in every quadrant. Isolated bright blobs, the two broad
+low-frequency lobes that flank DC, and random noise have no equally-spaced
+companions, so they are rejected. A grid of circled peaks is a classic
+generator fingerprint; clean real footage usually shows none.
 
 ### 5. Combined score
 
@@ -130,8 +142,9 @@ are calibrated to detect common traits of text-to-video diffusion models
 | `flicker_strength` | Lower per-pixel flicker strength. |
 | `high_freq_energy_ratio` | Lower spatial high-frequency energy. |
 
-Each term contributes 25% of the score. A `Verdict` line is also written:
-`LEANS REAL` (< 0.35), `UNCERTAIN` (0.35–0.55), or `LEANS SYNTHETIC` (≥ 0.55).
+Each term contributes 25% of the score. A `Verdict` is also shown in bold on
+the `video_result.png` image: `LEANS REAL` (< 0.35), `UNCERTAIN` (0.35–0.55),
+or `LEANS SYNTHETIC` (≥ 0.55).
 
 This is **not** a trained classifier. Re-calibrate the thresholds in
 `compute_score()` via `calibrate.py` against your own labelled clips before
@@ -141,6 +154,11 @@ and codecs.
 ---
 
 ## Gallery — Example outputs
+
+> The images below show each analysis component individually for clarity. In a
+> real run these (RAPSD, temporal spectrum, flicker map and fingerprint FFT)
+> are combined into a single `video_result.png` alongside the readings and the
+> score/verdict.
 
 ### Spatial spectrum
 
