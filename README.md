@@ -153,6 +153,36 @@ and codecs.
 
 ---
 
+## Consolidated Results Panel
+
+A single run produces one `video_result.png` that gathers every analysis into a
+labelled panel — there is no need to cross-reference separate files. The example
+below is the output for one of the Grok-generated clips (`ai_gen.mp4`):
+
+![Consolidated result panel for ai_gen.mp4](images/ai_gen_result.png)
+
+Reading it top to bottom:
+
+- **RAPSD (top-left)** — the high-pass residual (blue) sits abnormally high and
+  flat instead of falling off, while the raw frame (orange) loses high-frequency
+  power early; both are typical of over-smoothed synthetic detail.
+- **Temporal power spectrum (top-right)** — energy collapses quickly toward
+  higher temporal frequencies, reflecting the over-smooth, low-flicker motion of
+  diffusion video.
+- **Per-pixel flicker map (mid-left)** and **fingerprint FFT amplitude
+  (mid-right)** — here the fingerprint shows only a diffuse leakage cross with
+  *no strong peaks*, so **0 hot spots are circled**: this clip has no discrete
+  upsampling lattice, and the verdict rests on the other features.
+- **Readings block** — the file, frame count, active scorer (hand-tuned ramps,
+  no calibration model), hot-spot count, and every raw feature value.
+- **Verdict (bottom)** — the fused `Synthetic likelihood: 0.665 · LEANS
+  SYNTHETIC`, with the 0 = real-like / 1 = synthetic-like scale beneath it.
+
+This is the file you actually get per video; the gallery below breaks the same
+components out individually only for explanation.
+
+---
+
 ## Gallery — Example outputs
 
 > The images below show each analysis component individually for clarity. In a
