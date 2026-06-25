@@ -1,8 +1,8 @@
-# Video Spectra — Spectral Analysis for AI-Generated Video Detection
+# Spectral Analysis for AI-Generated Video Detection
 
 A Python tool that takes an MP4 video, renders its per-frame frequency-space
 (FFT) spectrum as a new MP4, and analyses the clip for spectral/temporal
-fingerprints commonly left by AI-generated (GAN / diffusion) video.
+fingerprints commonly left by AI-generated (GAN / diffusion) video. I had AI write this README and there appears to be a lot wrong with it. I will review it myself and make the necessary changes when I find the time.
 
 > **Important:** every metric here is a *heuristic*, not proof. Video
 > compression weakens these signals and newer generators actively suppress
@@ -17,7 +17,7 @@ For any input `video.mp4`, the tool writes three files next to the original:
 
 | Output | Description |
 | --- | --- |
-| `video_spectra.mp4` | 512×512 (1:1) colour spectrum video — one FFT frame per source frame, log-scaled, inferno colormap. |
+| `video_spectra.mp4` | 512×512 (1:1) colour spectrum video — one FFT frame per source frame, log-scaled, inferno colormap. Provided more for aesthetic purposes than practical utility |
 | `video_result.png` | One consolidated analysis image: the RAPSD curves, temporal power spectrum, per-pixel flicker map, residual-fingerprint FFT amplitude (with high-frequency AI hot spots circled), all feature readings, and the synthetic-likelihood score + verdict (in bold at the bottom). |
 | `video_rapsd.csv` | Summary features plus the full RAPSD curves (raw + residual) for numeric comparison. |
 
